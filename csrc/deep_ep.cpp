@@ -13,10 +13,10 @@
 namespace deep_ep {
 
 Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode, bool explicitly_destroy,
-               bool enable_elastic):
+               bool enable_shrink):
         rank(rank), num_ranks(num_ranks),
         num_nvl_bytes(num_nvl_bytes), num_rdma_bytes(num_rdma_bytes),
-        enable_elastic(enable_elastic),
+        enable_shrink(enable_shrink),
         low_latency_mode(low_latency_mode),
         explicitly_destroy(explicitly_destroy),
         comm_stream(at::cuda::getStreamFromPool(true)) {
@@ -233,8 +233,8 @@ void Buffer::sync(const std::vector<int> &device_ids,
         // Clean buffer (mainly for low-latency mode)
         CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
 
-        // Allocate and clean elastic buffer
-        if(enable_elastic) {
+        // Allocate and clean shrink buffer
+        if(enable_shrink) {
             int num_mask_buffer_bytes = num_ranks * sizeof(int);
             int num_sync_buffer_bytes = num_ranks * sizeof(int);
             mask_buffer_ptr = reinterpret_cast<int*>(internode::alloc(num_mask_buffer_bytes, NUM_BUFFER_ALIGNMENT_BYTES));
@@ -1355,13 +1355,13 @@ bool is_sm90_compiled() {
 }
 
 void Buffer::low_latency_update_mask_buffer(int rank_to_mask, bool mask) {
-    EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Elastic mode must be enabled");
+    EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     EP_HOST_ASSERT(rank_to_mask >= 0 and rank_to_mask < num_ranks);
     internode_ll::update_mask_buffer(mask_buffer_ptr, rank_to_mask, mask, at::cuda::getCurrentCUDAStream());
 }
 
 void Buffer::low_latency_query_mask_buffer(const torch::Tensor& mask_status) {
-    EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Elastic mode must be enabled");
+    EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     EP_HOST_ASSERT(mask_status.numel() == num_ranks && mask_status.scalar_type() == torch::kInt32);
 
     internode_ll::query_mask_buffer(mask_buffer_ptr, num_ranks,
@@ -1370,7 +1370,7 @@ void Buffer::low_latency_query_mask_buffer(const torch::Tensor& mask_status) {
 }
 
 void Buffer::low_latency_clean_mask_buffer() {
-    EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Elastic mode must be enabled");
+    EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
 }
 

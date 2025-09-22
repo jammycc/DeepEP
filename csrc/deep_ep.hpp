@@ -39,8 +39,8 @@ private:
     int64_t num_rdma_bytes;
     void* rdma_buffer_ptr = nullptr;
 
-    // Elastic mode buffer
-    bool enable_elastic = false;
+    // Shrink mode buffer
+    bool enable_shrink = false;
     int *mask_buffer_ptr = nullptr;
     int *sync_buffer_ptr = nullptr;
 
@@ -82,7 +82,7 @@ private:
     int* moe_recv_rdma_counter_mapped = nullptr;
 
 public:
-    Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode, bool explicitly_destroy, bool enable_elastic);
+    Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode, bool explicitly_destroy, bool enable_shrink);
 
     ~Buffer() noexcept(false);
 
