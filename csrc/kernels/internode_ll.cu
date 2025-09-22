@@ -8,51 +8,10 @@ namespace deep_ep {
 namespace internode_ll {
 
 template <int kNumThreads> __launch_bounds__(kNumThreads, 1)
-__global__ void barrier_with_mask(int rank, int num_ranks,
-                                  int* mask_buffer_ptr,
-                                  int* sync_buffer_ptr) {
-    EP_DEVICE_ASSERT(kNumThreads >= num_ranks);
-    auto thread_id = static_cast<int>(threadIdx.x);
-
-    int cnt_before_update = sync_buffer_ptr[rank];
-
-    if (thread_id < num_ranks && rank != thread_id) {
-        const auto dst_rank = thread_id;
-        const auto dst_ptr = reinterpret_cast<uint64_t>(sync_buffer_ptr + rank);
-        const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
-        
-        if (mask_buffer_ptr == nullptr || ld_acquire_sys_global(mask_buffer_ptr + dst_rank) == 0) {
-            // Update remote counter
-            if (dst_p2p_ptr == 0) {
-                nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), -1, dst_rank, 0);
-            } else {
-                st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), cnt_before_update - 1);
-            }
-            auto start_time = clock64();
-            uint64_t wait_recv_cost = 0;
-            // Wait for local counter to be updated
-            while ((ld_acquire_global(sync_buffer_ptr + dst_rank) != (cnt_before_update - 1))               // remote is not ready
-                   && (mask_buffer_ptr == nullptr || ((wait_recv_cost = clock64()-start_time) <= NUM_TIMEOUT_CYCLES)) // not timeout
-            );
-            // Mask rank if timeout
-            if (mask_buffer_ptr != nullptr && wait_recv_cost > NUM_TIMEOUT_CYCLES) {
-                atomicExch(mask_buffer_ptr + dst_rank, 1);
-                // printf("[rank %d] Clean LL buffer: rank %d is masked due to timeout\n", rank, dst_rank);
-            }
-        }
-    }
-
-    __syncthreads();
-    if (thread_id == 0) atomicAdd(sync_buffer_ptr + rank, -1);
-}
-
-template <int kNumThreads> __launch_bounds__(kNumThreads, 1)
 __global__ void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
-                                         int* clean_1, int num_clean_int_1,
-                                         bool barrier) {
+                                         int* clean_1, int num_clean_int_1) {
     // Barrier before cleaning (in case of unfinished chunked EP)
-    if (barrier)
-        nvshmemx_barrier_all_block();
+    nvshmemx_barrier_all_block();
 
     // Clean
     auto thread_id = static_cast<int>(threadIdx.x);
@@ -64,8 +23,59 @@ __global__ void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
         clean_1[i] = 0;
 
     // Barrier after cleaning (make sure the low-latency mode works fine)
-    if (barrier)
-        nvshmemx_barrier_all_block();
+    nvshmemx_barrier_all_block();
+}
+
+template <int kNumThreads> __launch_bounds__(kNumThreads, 1)
+__global__ void clean_low_latency_buffer_with_mask(int* clean_0, int num_clean_int_0,
+                                                   int* clean_1, int num_clean_int_1,
+                                                   int rank, int num_ranks, int* mask_buffer_ptr, int* sync_buffer_ptr) {
+    auto thread_id = static_cast<int>(threadIdx.x);
+    const auto num_rounds = 3; // Barrier - Clean - Barrier
+    for (int i = 0; i < num_rounds; i++) {
+        if (i != 1) {
+            // Barrier before cleaning (in case of unfinished chunked EP)
+            // and Barrier after cleaning (make sure the low-latency mode works fine)
+            int cnt_before_update = sync_buffer_ptr[rank];
+            EP_DEVICE_ASSERT(kNumThreads >= num_ranks);
+
+            if (thread_id < num_ranks && rank != thread_id) {
+                const auto dst_rank = thread_id;
+                const auto dst_ptr = reinterpret_cast<uint64_t>(sync_buffer_ptr + rank);
+                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+                
+                if (mask_buffer_ptr == nullptr || ld_acquire_sys_global(mask_buffer_ptr + dst_rank) == 0) {
+                    // Update remote counter
+                    if (dst_p2p_ptr == 0) {
+                        nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), -1, dst_rank, 0);
+                    } else {
+                        st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), cnt_before_update - 1);
+                    }
+                    auto start_time = clock64();
+                    uint64_t wait_recv_cost = 0;
+                    // Wait for local counter to be updated
+                    while ((ld_acquire_global(sync_buffer_ptr + dst_rank) != (cnt_before_update - 1))               // remote is not ready
+                        && (mask_buffer_ptr == nullptr || ((wait_recv_cost = clock64()-start_time) <= NUM_TIMEOUT_CYCLES)) // not timeout
+                    );
+                    // Mask rank if timeout
+                    if (mask_buffer_ptr != nullptr && wait_recv_cost > NUM_TIMEOUT_CYCLES) {
+                        atomicExch(mask_buffer_ptr + dst_rank, 1);
+                        // printf("[rank %d] Clean LL buffer: rank %d is masked due to timeout\n", rank, dst_rank);
+                    }
+                }
+            }
+            __syncthreads();
+            if (thread_id == 0) atomicAdd(sync_buffer_ptr + rank, -1);
+        } else {
+            // Clean
+            #pragma unroll
+            for (int i = thread_id; i < num_clean_int_0; i += kNumThreads)
+                clean_0[i] = 0;
+            #pragma unroll
+            for (int i = thread_id; i < num_clean_int_1; i += kNumThreads)
+                clean_1[i] = 0;
+        }
+    }
 }
 
 void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
@@ -78,13 +88,10 @@ void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
 
     if (sync_buffer_ptr == nullptr) {
         LAUNCH_KERNEL(&cfg, clean_low_latency_buffer<kNumThreads>,
-                    clean_0, num_clean_int_0, clean_1, num_clean_int_1, true);
+                    clean_0, num_clean_int_0, clean_1, num_clean_int_1);
     } else {
-        LAUNCH_KERNEL(&cfg, barrier_with_mask<kNumThreads>,
-                    rank, num_ranks, mask_buffer_ptr, sync_buffer_ptr);
-        LAUNCH_KERNEL(&cfg, clean_low_latency_buffer<kNumThreads>,
-                    clean_0, num_clean_int_0, clean_1, num_clean_int_1, false);
-        LAUNCH_KERNEL(&cfg, barrier_with_mask<kNumThreads>,
+        LAUNCH_KERNEL(&cfg, clean_low_latency_buffer_with_mask<kNumThreads>,
+                    clean_0, num_clean_int_0, clean_1, num_clean_int_1, \
                     rank, num_ranks, mask_buffer_ptr, sync_buffer_ptr);
     }
 }
